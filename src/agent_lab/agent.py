@@ -1,117 +1,124 @@
-from typing import Literal
-
-from google.adk import Agent
-from google.adk import Event
-from google.adk import Workflow
-from google.adk.events import RequestInput
+import os
+import asyncio
+from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
-from pydantic import BaseModel
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.adk.agents.run_config import RunConfig, StreamingMode
+from google.genai import types # Import genai types
 
+# 1. Define your action tools
+def turn_on_lights(room: str) -> str:
+    """
+    Turns on lights in the specified room.
+    
+    Args:
+        room: The name of the room.
+        
+    Returns:
+        A confirmation string.
+    """
+    print(f"\n[Tool Execution] Turning on {room} lights...")
+    return f"The {room} lights are now on."
 
-# 1. Categories updated to match realistic user intents
-class IntentCategory(BaseModel):
-    intent: Literal["account_action", "general_question", "other"]
-
-
-def process_input(node_input: str):
-    return Event(state={"input": node_input})
-
-
-# 2. Classifier prompt updated to explain HOW to categorize
-classify_intent = Agent(
+# 2. Initialize the Agent (The Brain)
+voice_brain = Agent(
     model=LiteLlm(model="ollama_chat/devstral-small-2"),
-    name="classify_intent",
-    instruction=(
-        "You are a routing assistant. Based on the input, decide the intent: {input}\n"
-        "- Choose 'account_action' if they want to manage their account or check a balance.\n"
-        "- Choose 'general_question' if they are asking for general information.\n"
-        "- Choose 'other' for anything else."
-    ),
-    output_schema=IntentCategory,
-    output_key="intent",
+    name="local_voice_brain",
+    instruction="You are a helpful home assistant. Keep responses short and conversational, as they will be spoken out loud. Use your tools when asked.",
+    tools=[turn_on_lights]
 )
 
+# 3. The Mouth (TTS Server Callback)
+def send_to_local_tts_server(sentence: str):
+    """
+    Simulates sending text to a local TTS server (e.g., Kokoro or Piper).
+    """
+    print(f"[TTS Audio Playing]: {sentence}")
 
-def route_on_intent(intent: IntentCategory):
-    """Yields an Event with a specific route based on the classification."""
-    yield Event(route=intent.intent)
+# 4. The Buffer Logic
+async def process_stream_for_tts(event_stream, tts_callback):
+    """
+    Buffers the ADK async event stream and triggers the TTS callback 
+    whenever a full sentence is formed.
+    """
+    buffer = ""
+    punctuation_marks = {'.', '?', '!'}
+    
+    # The Runner yields ADK 'Event' objects
+    async for event in event_stream:
+        # We only care about partial events (streaming chunks) that contain text
+        if event.partial and event.content and event.content.parts:
+            # Extract text safely
+            part = event.content.parts[0]
+            text_chunk = part.text if hasattr(part, 'text') else str(part)
+            buffer += text_chunk
+            
+            # Strip trailing whitespace to check the last actual character
+            stripped_buffer = buffer.strip()
+            if stripped_buffer and stripped_buffer[-1] in punctuation_marks:
+                tts_callback(stripped_buffer)
+                buffer = ""
+                
+    # Flush any remaining text that didn't end in punctuation
+    if buffer.strip():
+        tts_callback(buffer.strip())
 
-
-# 3. Account workflow with authentication state checking
-def check_auth_status(is_authenticated: bool = False):
-    """Check if the user is already authenticated in the workflow state."""
-    if is_authenticated:
-        yield Event(route="already_authenticated")
-    else:
-        yield Event(route="needs_auth")
-
-
-def collect_pin():
-    """Ask the user for their PIN if not authenticated."""
-    yield RequestInput(
-        message="I can help with your account. Please provide your 6-digit account PIN:",
-        response_schema=int
+# 5. Main Execution Loop
+async def main():
+    print("Agent is ready. Type your request (simulating STT). Type 'exit' to quit.")
+    
+    app_name = "local_voice_app"
+    user_id = "local_user"
+    
+    # 1. Initialize the Session Service
+    session_service = InMemorySessionService()
+    
+    # 2. Explicitly create the session BEFORE running the agent
+    # This registers the session in memory and generates a valid UUID for it.
+    session = await session_service.create_session(
+        app_name=app_name,
+        user_id=user_id
     )
-
-
-def process_account(node_input: int):
-    """Process the provided PIN and update the authenticated state."""
-    # node_input automatically captures the response from collect_pin
-    return Event(
-        state={"is_authenticated": True},
-        message=f"Successfully authenticated with PIN: {node_input}. Retrieving account details..."
+    
+    # 3. Use the base Runner and pass our configured session_service
+    runner = Runner(
+        agent=voice_brain,
+        app_name=app_name,
+        session_service=session_service
     )
+    
+    # Force the runner into Server-Sent Events (SSE) streaming mode
+    run_config = RunConfig(streaming_mode=StreamingMode.SSE)
+    
+    while True:
+        try:
+            user_input = input("\n[You (STT)]: ")
+            if user_input.lower() in ['exit', 'quit']:
+                break
+                
+            # Format the input as a strongly typed Content object
+            user_message = types.Content(
+                role="user", 
+                parts=[types.Part(text=user_input)]
+            )
+                
+            # 4. Start the streaming execution using the dynamic session.id
+            event_stream = runner.run_async(
+                user_id=user_id,
+                session_id=session.id, # Using the valid, registered ID
+                new_message=user_message, 
+                run_config=run_config
+            )
+            
+            # Pipe the async event stream through the sentence buffer
+            await process_stream_for_tts(event_stream, send_to_local_tts_server)
+            
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            break
+        except Exception as e:
+            print(f"\nAn error occurred: {e}")
 
-
-def handle_already_authenticated():
-    """Handle the case where the user is already authenticated."""
-    return Event(
-        message="You are already authenticated. Accessing your account details..."
-    )
-
-
-account_workflow = Workflow(
-    name="account_management",
-    edges=[
-        ('START', check_auth_status),
-        (
-            check_auth_status,
-            {
-                "needs_auth": collect_pin,
-                "already_authenticated": handle_already_authenticated,
-            },
-        ),
-        (collect_pin, process_account),
-    ],
-)
-
-
-# 4. A dedicated agent for answering actual questions
-answer_question = Agent(
-    model=LiteLlm(model="ollama_chat/devstral-small-2"),
-    name="answer_question",
-    instruction="Please answer the following user question clearly and concisely: {input}",
-)
-
-
-def handle_other():
-    yield Event(
-        message="I am a customer support bot. I can help you manage your account or answer general questions."
-    )
-
-
-# 5. The root workflow routes intents to their logical destinations
-root_agent = Workflow(
-    name="customer_support_router",
-    edges=[
-        ("START", process_input, classify_intent, route_on_intent),
-        (
-            route_on_intent,
-            {
-                "account_action": account_workflow,
-                "general_question": answer_question,
-                "other": handle_other,
-            },
-        ),
-    ],
-)
+if __name__ == "__main__":
+    asyncio.run(main())
