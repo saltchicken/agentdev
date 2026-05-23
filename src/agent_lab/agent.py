@@ -83,10 +83,30 @@ async def main():
     # 1. Initialize the Session Service
     session_service = DatabaseSessionService(db_url="sqlite+aiosqlite:///agent_sessions.db")
 
-    # 2. Explicitly create the session BEFORE running the agent
-    # This registers the session in memory and generates a valid UUID for it.
-    session = await session_service.create_session(app_name=app_name,
-                                                   user_id=user_id)
+    # # 2. Explicitly create the session BEFORE running the agent
+    # # This registers the session in memory and generates a valid UUID for it.
+    # session = await session_service.create_session(app_name=app_name,
+    #                                                user_id=user_id)
+
+
+    # 2. Retrieve or Create the Session
+    existing_sessions_response = await session_service.list_sessions(
+        app_name=app_name, 
+        user_id=user_id
+    )
+
+    # Check if the response contains a 'sessions' list and if it's not empty
+    if existing_sessions_response and existing_sessions_response.sessions:
+        # Grab the most recent session from the actual list inside the response
+        session = existing_sessions_response.sessions[-1]
+        print(f"[System] Resuming previous session: {session.id}")
+    else:
+        # If no history exists, create a brand new session
+        session = await session_service.create_session(
+            app_name=app_name, 
+            user_id=user_id
+        )
+        print(f"[System] Started new persistent session: {session.id}")
 
     # 3. Use the base Runner and pass our configured session_service
     runner = Runner(agent=voice_brain,
