@@ -1,6 +1,7 @@
 **/__pycache__
 .venv
 .env
-**/session.db
+*.db
 .adk
 *.egg-info
+
