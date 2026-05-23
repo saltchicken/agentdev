@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 
 from google.adk.agents import Agent
 from google.adk.agents.run_config import RunConfig
@@ -9,17 +10,16 @@ from google.adk.runners import Runner
 from google.adk.sessions import DatabaseSessionService
 from google.genai import types
 
+from client import Qwen3TTSClient
+
+tts = Qwen3TTSClient(server_url="http://10.0.0.17:8123/tts")
+tts.start()
+
 
 # 1. Define your action tools
 def turn_on_lights(room: str) -> str:
     """
     Turns on lights in the specified room.
-    
-    Args:
-        room: The name of the room.
-        
-    Returns:
-        A confirmation string.
     """
     print(f"\n[Tool Execution] Turning on {room} lights...")
     return f"The {room} lights are now on."
@@ -37,36 +37,28 @@ voice_brain = Agent(
 # 3. The Mouth (TTS Server Callback)
 def send_to_local_tts_server(sentence: str):
     """
-    Simulates sending text to a local TTS server (e.g., Kokoro or Piper).
+    Simulates sending text to a local TTS server.
     """
-    print(f"[TTS Audio Playing]: {sentence}")
+    tts.speak(sentence)
 
 
 # 4. The Buffer Logic
 async def process_stream_for_tts(event_stream, tts_callback):
-    """
-    Buffers the ADK async event stream and triggers the TTS callback 
-    whenever a full sentence is formed.
-    """
     buffer = ""
     punctuation_marks = {'.', '?', '!'}
 
-    # The Runner yields ADK 'Event' objects
     async for event in event_stream:
-        # We only care about partial events (streaming chunks) that contain text
+
         if event.partial and event.content and event.content.parts:
-            # Extract text safely
             part = event.content.parts[0]
             text_chunk = part.text if hasattr(part, 'text') else str(part)
             buffer += text_chunk
 
-            # Strip trailing whitespace to check the last actual character
             stripped_buffer = buffer.strip()
             if stripped_buffer and stripped_buffer[-1] in punctuation_marks:
                 tts_callback(stripped_buffer)
                 buffer = ""
 
-    # Flush any remaining text that didn't end in punctuation
     if buffer.strip():
         tts_callback(buffer.strip())
 
@@ -74,74 +66,104 @@ async def process_stream_for_tts(event_stream, tts_callback):
 # 5. Main Execution Loop
 async def main():
     print(
-        "Agent is ready. Type your request (simulating STT). Type 'exit' to quit."
+        "Agent is ready. Type your request (simulating STT). Type 'exit' to quit.\n"
+        "[Tip: Press Ctrl+C while the agent is speaking to interrupt it.]"
     )
 
     app_name = "local_voice_app"
     user_id = "local_user"
 
-    # 1. Initialize the Session Service
     session_service = DatabaseSessionService(db_url="sqlite+aiosqlite:///agent_sessions.db")
 
-    # # 2. Explicitly create the session BEFORE running the agent
-    # # This registers the session in memory and generates a valid UUID for it.
-    # session = await session_service.create_session(app_name=app_name,
-    #                                                user_id=user_id)
-
-
-    # 2. Retrieve or Create the Session
     existing_sessions_response = await session_service.list_sessions(
         app_name=app_name, 
         user_id=user_id
     )
 
-    # Check if the response contains a 'sessions' list and if it's not empty
     if existing_sessions_response and existing_sessions_response.sessions:
-        # Grab the most recent session from the actual list inside the response
         session = existing_sessions_response.sessions[-1]
         print(f"[System] Resuming previous session: {session.id}")
     else:
-        # If no history exists, create a brand new session
         session = await session_service.create_session(
             app_name=app_name, 
             user_id=user_id
         )
         print(f"[System] Started new persistent session: {session.id}")
 
-    # 3. Use the base Runner and pass our configured session_service
     runner = Runner(agent=voice_brain,
                     app_name=app_name,
                     session_service=session_service)
 
-    # Force the runner into Server-Sent Events (SSE) streaming mode
     run_config = RunConfig(streaming_mode=StreamingMode.SSE)
 
     while True:
+        # This catches standard Ctrl+C to exit the program while waiting for user input
         try:
             user_input = input("\n[You (STT)]: ")
-            if user_input.lower() in ['exit', 'quit']:
-                break
-
-            # Format the input as a strongly typed Content object
-            user_message = types.Content(role="user",
-                                         parts=[types.Part(text=user_input)])
-
-            # 4. Start the streaming execution using the dynamic session.id
-            event_stream = runner.run_async(
-                user_id=user_id,
-                session_id=session.id,  # Using the valid, registered ID
-                new_message=user_message,
-                run_config=run_config)
-
-            # Pipe the async event stream through the sentence buffer
-            await process_stream_for_tts(event_stream, send_to_local_tts_server)
-
         except KeyboardInterrupt:
-            print("\nExiting...")
+            if hasattr(tts, 'interrupt'):
+                tts.interrupt()
+            print()
+            continue
+
+        if user_input.lower() in ['exit', 'quit']:
             break
+            
+        if not user_input.strip():
+            continue
+
+        if hasattr(tts, 'interrupt'):
+            tts.interrupt()
+
+        user_message = types.Content(role="user",
+                                     parts=[types.Part(text=user_input)])
+
+        event_stream = runner.run_async(
+            user_id=user_id,
+            session_id=session.id,
+            new_message=user_message,
+            run_config=run_config)
+
+        # === SIGNAL HANDLING MAGIC ===
+        # We temporarily hijack the SIGINT (Ctrl+C) signal so it cancels the task 
+        # instead of killing the event loop.
+        main_task = asyncio.current_task()
+        loop = asyncio.get_running_loop()
+
+        def _cancel_stream():
+            if main_task:
+                main_task.cancel()
+
+        loop.add_signal_handler(signal.SIGINT, _cancel_stream)
+
+        try:
+            await process_stream_for_tts(event_stream, send_to_local_tts_server)
+        except asyncio.CancelledError:
+            print("\n[System] 🛑 Agent interrupted! Ready for your next request.")
+            # Safely close the OpenTelemetry generator to prevent context leaks
+            if hasattr(tts, 'interrupt'):
+                tts.interrupt()
+            else:
+                print("didn't work")
+            try:
+                if hasattr(event_stream, 'aclose'):
+                    await event_stream.aclose()
+            except Exception:
+                pass 
         except Exception as e:
             print(f"\nAn error occurred: {e}")
+        finally:
+            # Always restore normal Ctrl+C behavior for the input() prompt
+            loop.remove_signal_handler(signal.SIGINT)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass # Handle cleanly if triggered right at startup
+    finally:
+        loop.close()
+        tts.close()
