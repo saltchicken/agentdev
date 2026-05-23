@@ -9,6 +9,8 @@ description = "A simple LLM agent for rolling dice and checking primes."
 requires-python = ">=3.10"
 dependencies = [
     "google-adk[extensions]",
+    "httpx",
+    "httpx-sse"
 ]
 
 [project.optional-dependencies]
