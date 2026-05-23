@@ -6,8 +6,8 @@ from google.adk.agents.run_config import RunConfig
 from google.adk.agents.run_config import StreamingMode
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
-from google.genai import types  # Import genai types
+from google.adk.sessions import DatabaseSessionService
+from google.genai import types
 
 
 # 1. Define your action tools
@@ -81,7 +81,7 @@ async def main():
     user_id = "local_user"
 
     # 1. Initialize the Session Service
-    session_service = InMemorySessionService()
+    session_service = DatabaseSessionService(db_url="sqlite+aiosqlite:///agent_sessions.db")
 
     # 2. Explicitly create the session BEFORE running the agent
     # This registers the session in memory and generates a valid UUID for it.
