@@ -5,3 +5,4 @@
 .adk
 *.egg-info
 
+agent_sessions.db
