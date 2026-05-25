@@ -17,7 +17,7 @@ from jenova.nodes import math_expert
 from jenova.nodes import QuestionCategory
 from jenova.nodes import take_action
 from jenova.nodes import tech_expert
-from jenova.nodes import tts_formatter
+from jenova.nodes import format_expert_response
 from jenova.utils import get_full_history
 
 
@@ -61,10 +61,10 @@ root_agent = Workflow(
                 "general": general_expert,
             },
         ),
-        (take_action, tts_formatter),
-        (handle_other, tts_formatter),
-        (tech_expert, tts_formatter),
-        (math_expert, tts_formatter),
-        (general_expert, tts_formatter),
+        (take_action, format_expert_response),
+        (handle_other, format_expert_response),
+        (tech_expert, format_expert_response),
+        (math_expert, format_expert_response),
+        (general_expert, format_expert_response),
     ],
 )
